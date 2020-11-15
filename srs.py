@@ -6,9 +6,6 @@ import ctypes
 import array
 import arrow
 import wave
-import scipy.io.wavfile
-import numpy
-import time
 
 MSG_UPDATE = 0
 MSG_PING = 1
@@ -151,9 +148,6 @@ class Radio:
         wave_file.setnchannels(2)
         wave_file.setframerate(self.sample_rate)
         wave_file.setsampwidth(2)
-        #wave_file.close()
-
-        #self.out_file_handle = wave_file
         self.out_file = wave_file
         self.receiving = False
         self.started_receiving = False
@@ -163,17 +157,13 @@ class Radio:
 
     def write_audio(self, data):
         self.out_file.writeframes(data)
-        # this apparently appends by default (and manages the file being open/closed)
-        #scipy.io.wavfile.write(self.out_file, self.sample_rate, numpy.frombuffer(data, dtype=float))
 
     def flush_buffer(self):
         if self.buffer:
             self.out_file.writeframes(self.buffer)
             self.buffer = b''
-        #scipy.io.wavfile.write(self.out_file, self.sample_rate, numpy.frombuffer(self.buffer, dtype=float))
 
     def generate_silence(self, duration):
-        bytes_per_sample = 2   # we always have this set to 2
         channels = 2           # hard-coded for now. probably will need to update at some point
         # number of bytes we need to fill for the difference between end and start times
         silence_size = int(self.sample_rate * duration)
@@ -254,7 +244,18 @@ class SRSRecorder:
         self.stop_audio_tick = False
 
     def __del__(self):
-        pass
+        print("AUDIO:: caught __del__")
+        for freq, radio in self.radios.items():
+            now = arrow.now()
+            radio.generate_silence((now - radio.last_stream_ended).total_seconds())
+            radio.out_file.close()
+
+    def __exit__(self):
+        print("AUDIO:: caught __exit__")
+        for freq, radio in self.radios.items():
+            now = arrow.now()
+            radio.generate_silence((now - radio.last_stream_ended).total_seconds())
+            radio.out_file.close()
 
     def connect(self):
         """
@@ -285,7 +286,6 @@ class SRSRecorder:
         """
         while True:
             data = self.tcp_socket.recv(8092)
-            #print("got data", data.decode())
             lines = data.decode().splitlines()
             if data == b'':
                 print("Connection closed")
@@ -405,20 +405,15 @@ class SRSRecorder:
             except Exception as e:
                 pass
                 print(e)
-            # remove the continue to print out incoming CMD traffic
-            #continue
-            #print("CMD >>", (message), address)
 
     def parse_cmd(self, message):
         try:
             msg = json.loads(message[28:].decode())
         except Exception as e:
-            #print(e)
             return
         for radio in msg['RadioReceivingState']:
             if radio and radio['IsReceiving'] != self.receiving:
                 self.receiving = radio['IsReceiving']
-                #print("Receiving:", radio['IsReceiving'])
 
     def spawn_udp_voice(self):
         """
@@ -431,7 +426,6 @@ class SRSRecorder:
         self.udp_socket_voice.sendto(self.client_guid.encode(), (self.host, 5002))
         message, address = self.udp_socket_voice.recvfrom(65535)
         print("Initial sync:", message, address)
-        #self.udp_socket.bind(('0.0.0.0', 5003))
         self.read_udp()
 
     def read_udp(self):
@@ -442,7 +436,6 @@ class SRSRecorder:
         """
         while True:
             message, address = self.udp_socket_voice.recvfrom(65535)
-            #print(len(message), address)
             if address[0] != self.host:
                 # random stuff, not actually from the server
                 print("ignoring message")
@@ -488,15 +481,6 @@ class SRSRecorder:
                         self.radios[freq].receiving = True
                         if parsed_frames:
                             self.radios[freq].buffer += parsed_frames
-                            # write out the parsed frames
-                            #self.radios[freq].write_audio(parsed_frames)
-                            #if current_time != self.radios[freq].last_received_time:
-                            #    # this is not the first message; we may need to generate silence
-                            #    pass
-                        else:
-                            # silence? something?
-                            pass
-                    #print(parsed_voice)
             else:
                 print("VOICE >> DISCARDED INVALID MESSAGE:", message)
         else:
@@ -546,7 +530,8 @@ class SRSRecorder:
             return None
 
     def check_valid_traffic(self, message):
-        # checking is done here - https://github.com/ciribob/DCS-SimpleRadioStandalone/blob/c8f233a0eede26dc825499aa9dc86ccb4aa8df6d/DCS-SR-Client/Network/UDPVoiceHandler.cs#L326
+        # checking is done here -
+        # https://github.com/ciribob/DCS-SimpleRadioStandalone/blob/c8f233a0eede26dc825499aa9dc86ccb4aa8df6d/DCS-SR-Client/Network/UDPVoiceHandler.cs#L326
         # we want all traffic for now
         return True
 
