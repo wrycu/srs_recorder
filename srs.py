@@ -6,6 +6,7 @@ import ctypes
 import array
 import arrow
 import wave
+import os
 
 MSG_UPDATE = 0
 MSG_PING = 1
@@ -242,6 +243,7 @@ class SRSRecorder:
         self.radios = {}
         self.receiving = False
         self.stop_audio_tick = False
+        self.mission_start_time = None
 
     def __del__(self):
         print("AUDIO:: caught __del__")
@@ -382,6 +384,7 @@ class SRSRecorder:
         _thread.start_new_thread(self.spawn_udp_voice, ())
         _thread.start_new_thread(self.spawn_udp_cmd, ())
         _thread.start_new_thread(self.audio_tick, ())
+        _thread.start_new_thread(self.spawn_mission_tracker, ())
 
     def spawn_udp_cmd(self):
         """
@@ -414,6 +417,24 @@ class SRSRecorder:
         for radio in msg['RadioReceivingState']:
             if radio and radio['IsReceiving'] != self.receiving:
                 self.receiving = radio['IsReceiving']
+
+    def spawn_mission_tracker(self):
+        udp_mission_sock = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM, proto=socket.IPPROTO_UDP)
+        udp_mission_sock.bind(('127.0.0.1', 5190))
+        while True:
+            message = udp_mission_sock.recv(65535)
+            if message == b'MISSION_START' and not self.mission_start_time:
+                print("Caught mission start")
+                self.mission_start_time = arrow.now()
+            elif message == b'MISSION_END':
+                print("Caught mission end")
+                # generate silence at the end of all recordings so they're the same length
+                now = arrow.now()
+                for freq, radio in self.radios:
+                    last_msg_delta = (now - radio.last_stream_ended).total_seconds()
+                    if last_msg_delta:
+                        radio.generate_silence(last_msg_delta)
+                os._exit(0)
 
     def spawn_udp_voice(self):
         """
@@ -473,6 +494,11 @@ class SRSRecorder:
                                 decoder=OpusDecoder(48000, 2, 'C:\\Program Files\\DCS-SimpleRadio-Standalone\\opus.dll'),
                                 out_file=str(freq) + '.wav',
                             )
+                            # check if the mission has been running since before we heard audio on this freq and add it
+                            #   if it has
+                            mission_start_delta = (arrow.now() - self.mission_start_time).total_seconds()
+                            if mission_start_delta:
+                                self.radios[freq].generate_silence(mission_start_delta)
                         self.radios[freq].last_received_time = current_time
                         # decode the (opus) packet
                         parsed_frames = self.radios[freq].opus_decoder.decode(parsed_voice)
