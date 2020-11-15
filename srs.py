@@ -1,7 +1,6 @@
 import socket
 import json
 import _thread
-import time
 import struct
 import ctypes
 import array
@@ -22,25 +21,50 @@ MSG_E_AWACS_DC = 8
 
 # voice decoding constants
 GUID_LENGTH = 22
-PACKET_HEADER_LENGTH = 2 + 2 + 2  # https://github.com/ciribob/DCS-SimpleRadioStandalone/blob/91f7e575347b1113c5e2bb08cba0031c53201f23/DCS-SR-Common/Network/UDPVoicePacket.cs#L35
-FIXED_PACKET_LENGTH = 4 + 8 + 0 + GUID_LENGTH + GUID_LENGTH  # https://github.com/ciribob/DCS-SimpleRadioStandalone/blob/91f7e575347b1113c5e2bb08cba0031c53201f23/DCS-SR-Common/Network/UDPVoicePacket.cs#L45
-FREQUENCY_SEGMENT_LENGTH = 8 + 1 + 1  # https://github.com/ciribob/DCS-SimpleRadioStandalone/blob/91f7e575347b1113c5e2bb08cba0031c53201f23/DCS-SR-Common/Network/UDPVoicePacket.cs#L40
+# https://github.com/ciribob/DCS-SimpleRadioStandalone/blob/91f7e575347b1113c5e2bb08cba0031c53201f23/DCS-SR-Common/Network/UDPVoicePacket.cs#L35
+PACKET_HEADER_LENGTH = 2 + 2 + 2
+# https://github.com/ciribob/DCS-SimpleRadioStandalone/blob/91f7e575347b1113c5e2bb08cba0031c53201f23/DCS-SR-Common/Network/UDPVoicePacket.cs#L45
+FIXED_PACKET_LENGTH = 4 + 8 + 0 + GUID_LENGTH + GUID_LENGTH
+# https://github.com/ciribob/DCS-SimpleRadioStandalone/blob/91f7e575347b1113c5e2bb08cba0031c53201f23/DCS-SR-Common/Network/UDPVoicePacket.cs#L40
+FREQUENCY_SEGMENT_LENGTH = 8 + 1 + 1
 
 
 class DecoderStructDoNotUse(ctypes.Structure):
+    """
+    We need some sort of object in order for decoding state to be stored
+    As the name implies, this class is not intended to be used outside of being passed around libopus
+    """
     pass
 
 
 class OpusDecoder:
+    """
+    Python decoder which simplifies the calls to the underlying DLL (which does all of the heavy lifting)
+    Intended usage is to create the object, call create() (which creates the state object) and then decode at will
+    See https://opus-codec.org/docs/opus_api-1.3.1/group__opus__decoder.html for more information
+    """
     def __init__(self, bitrate, channels, dll_path, buffer_size=192000):
         self.bitrate = bitrate
         self.channels = channels
+        # This is not a native Python implementation. You must reference an Opus DLL capable of doing the actual
+        #   decoding
         self.dll_path = dll_path
+        # Opus decoding is stateful; as such, we must track where we are in decoding. This object does that.
         self.decoder_obj = None
+        # This is the actual function within the DLL. Called to decode packets.
         self.decode_func = None
         self.frame_count = self.get_frame_count(buffer_size)
 
     def create(self):
+        """
+        Creates the Opus decoder as described in
+            https://opus-codec.org/docs/opus_api-1.3.1/group__opus__decoder.html#ga753f6fe0b699c81cfd47d70c8e15a0bd
+        Must be called prior to decode()
+        :return:
+            N/A
+        """
+
+        # pre-populate input and output types
         create_func = ctypes.CDLL(self.dll_path).opus_decoder_create
         create_func.argtypes = [
             ctypes.c_int,
@@ -61,11 +85,28 @@ class OpusDecoder:
 
         # set up is complete, create the decoder state
         create_decoder_result = ctypes.c_int()  # used to track outcome of attempt to create decoder state object
-        self.decoder_obj = create_func(ctypes.c_int(self.bitrate), ctypes.c_int(self.channels), ctypes.byref(create_decoder_result))
+        self.decoder_obj = create_func(
+            ctypes.c_int(self.bitrate),
+            ctypes.c_int(self.channels),
+            ctypes.byref(create_decoder_result),
+        )
         if create_decoder_result.value != 0:
             raise Exception("Failed to create decoder state object: {}".format(create_decoder_result))
 
     def decode(self, voice_packet):
+        """
+        Perform the actual decoding of Opus packets as described on
+            https://opus-codec.org/docs/opus_api-1.3.1/group__opus__decoder.html#ga7d1111f64c36027ddcb81799df9b3fc9
+        You MUST call create() first
+        :param voice_packet:
+            A dict containing a packet containing voice data
+            {
+                'audio_part1_bytes': b'',
+                'audio_part1_length': 0,
+            }
+        :return:
+            A bytes object containing raw PCM data
+        """
         if not self.decoder_obj:
             raise Exception("You must call create() first")
         data_pointer = ctypes.cast(voice_packet['audio_part1_bytes'], ctypes.POINTER(ctypes.c_ubyte))
@@ -94,14 +135,20 @@ class OpusDecoder:
 
 
 class Radio:
+    """
+    Intended to track all data related to a given frequency for SRS
+    """
     def __init__(self, frequency, decoder, out_file):
+        self.sample_rate = 48000  # this should probably be specified upstream, but for now we know it'll be 48,000
         self.frequency = frequency
+        # decoder should be an OpusDecoder object
         self.opus_decoder = decoder
         self.opus_decoder.create()
+        # for testing, we want to overwrite existing recordings. This will probably get removed as the project matures
         # zero out the file (yes there are easier ways to do it)
         wave_file = wave.open(out_file, 'wb')
         wave_file.setnchannels(2)
-        wave_file.setframerate(48000)
+        wave_file.setframerate(self.sample_rate)
         wave_file.setsampwidth(2)
         wave_file.close()
 
@@ -113,17 +160,19 @@ class Radio:
 
     def write_audio(self, data):
         # this apparently appends by default (and manages the file being open/closed)
-        scipy.io.wavfile.write(self.out_file, 48000, numpy.frombuffer(data, dtype=float))
+        scipy.io.wavfile.write(self.out_file, self.sample_rate, numpy.frombuffer(data, dtype=float))
 
 
 class SRSRecorder:
     def __init__(self):
-        self.host = '47.13.59.190' #'127.0.0.1'
         self.host = '127.0.0.1'
         self.port = 5002
         self.nick = 'RECORDER'
         self.version = '1.9.2.1'
+        # this is the ID used on the SRS network. I changed a single character in mine. No idea if it's unique
+        #   or even if it needs to be. Hope stuff works :)
         self.client_guid = 'Cg1jAqxRakO0NxsDQnCcpg'
+        # track the server settings. Not really used now, but could come in handy in the long term
         self.server_settings = {
             'CLIENT_EXPORT_ENABLED': False,
             'EXTERNAL_AWACS_MODE': False,
@@ -146,6 +195,7 @@ class SRSRecorder:
         }
         self.tcp_socket = None
         self.connected_clients = []
+        # track our own state. Sometimes sent to the SRS server to update it on where we are and all that jazz
         self.state_blob = {
             "Client": {
                 "ClientGuid": self.client_guid,
@@ -182,10 +232,12 @@ class SRSRecorder:
 
     def __del__(self):
         pass
-        #for file in self.freq_to_file_handle.values():
-        #    file.close()
 
     def connect(self):
+        """
+        Connect to the SRS server and begin reading TCP traffic
+        :return:
+        """
         connect_blob = self.state_blob
         for x in range(0, 11):
             connect_blob['Client']['RadioInfo']['radios'].append({
@@ -203,6 +255,11 @@ class SRSRecorder:
         self.read_tcp()
 
     def read_tcp(self):
+        """
+        Read TCP traffic forever. Mostly ignored right now, but can be used in the future
+        :return:
+            Does not return
+        """
         while True:
             data = self.tcp_socket.recv(8092)
             #print("got data", data.decode())
@@ -217,9 +274,16 @@ class SRSRecorder:
                 print("YOU SHOULD NEVER SEE THIS", data)
 
     def parse_response(self, msg):
+        """
+        Parses data sent over the SRS TCP connection. This is mostly state updates, e.g. a new client connecting
+        :param msg:
+            Message sent from the server. Expected to be a JSON blob
+        :return:
+        """
         parsed = json.loads(msg)
         msg_type = parsed['MsgType']
         '''
+        Types of messages
         MSG_UPDATE = 0
         MSG_PING = 1
         MSG_SYNC = 2
@@ -272,6 +336,12 @@ class SRSRecorder:
                 })
 
     def send_slotted(self):
+        """
+        Tells the SRS server we are in game and notifies it which radios we have and which frequencies they are tuned to
+        Additionally spawns the UDP threads to receive voice and voice-cmd data
+        :return:
+            N/A
+        """
         self.state_blob['MsgType'] = MSG_RADIO_UPDATE
         self.state_blob['Client']['Coalition'] = 2
         self.state_blob['Client']['RadioInfo']['unit'] = 'A-10C'
@@ -290,6 +360,14 @@ class SRSRecorder:
         _thread.start_new_thread(self.spawn_udp_cmd, ())
 
     def spawn_udp_cmd(self):
+        """
+        UDP command connection. I haven't seen a lot of useful data sent over this, but it's possible there is good stuff
+        For the purposes of testing, a UDP packet containing 'abcd' in characters 28-32 will cause the packet to be
+            treated as an incoming voice packet. This permits easy calling into the voice decoding code without having
+            to muck around with how it's received or do complex spoofing a client sending traffic junk
+        :return:
+            N/A
+        """
         self.udp_socket_cmd = socket.socket(family=socket.AF_INET, type=socket.SOCK_RAW, proto=socket.IPPROTO_UDP)
         self.udp_socket_cmd.sendto('hello'.encode(), (self.host, 5002))
         while True:
@@ -319,6 +397,11 @@ class SRSRecorder:
                 #print("Receiving:", radio['IsReceiving'])
 
     def spawn_udp_voice(self):
+        """
+        Create the initial UDP connection and hand things off to the listener function
+        :return:
+            N/A
+        """
         print("Spawned UDP listener")
         self.udp_socket_voice = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM, proto=socket.IPPROTO_UDP)
         self.udp_socket_voice.sendto(self.client_guid.encode(), (self.host, 5002))
@@ -328,6 +411,11 @@ class SRSRecorder:
         self.read_udp()
 
     def read_udp(self):
+        """
+        Listen for voice traffic and attempt to parse/handle it if it's received
+        :return:
+            N/A
+        """
         while True:
             message, address = self.udp_socket_voice.recvfrom(65535)
             #print(len(message), address)
@@ -344,13 +432,24 @@ class SRSRecorder:
             self.parse_voice(message)
 
     def parse_voice(self, message):
+        """
+        Handles incoming voice traffic. This is the code that connects all of the bits
+        :param message:
+            UDP packet sent by SRS
+        :return:
+            N/A
+        """
         current_time = arrow.now()
-        #print("caught voice")
+        # check of the message contains data
         if len(message) > PACKET_HEADER_LENGTH + FIXED_PACKET_LENGTH + FREQUENCY_SEGMENT_LENGTH:
+            # check if the packet is valid
             if self.check_valid_traffic(message):
+                # decode the (UDP) packet
                 parsed_voice = self.decode_voice_packet(message)
                 if parsed_voice:
+                    # a single packet can contain multiple frequencies worth of data
                     for freq in parsed_voice['frequencies']:
+                        # check if this is the first time we have seen this frequency and do some initial set up if so
                         if freq not in self.radios.keys():
                             self.radios[freq] = Radio(
                                 frequency=48000,
@@ -358,13 +457,13 @@ class SRSRecorder:
                                 out_file=str(freq) + '.wav',
                             )
                             self.radios[freq].last_received_time = current_time
-
+                        # decode the (opus) packet
                         parsed_frames = self.radios[freq].opus_decoder.decode(parsed_voice)
                         if parsed_frames:
-                            #self.radios[freq].out_file_handle.writeframes(parsed_frames)
+                            # write out the parsed frames
                             self.radios[freq].write_audio(parsed_frames)
                             if current_time != self.radios[freq].last_received_time:
-                                # this is not the first message, we may need to generate silence
+                                # this is not the first message; we may need to generate silence
                                 pass
                         else:
                             # silence? something?
@@ -372,7 +471,6 @@ class SRSRecorder:
                     #print(parsed_voice)
             else:
                 print("VOICE >> DISCARDED INVALID MESSAGE:", message)
-            #print("VOICE >>", sender_guid, raw_transmission)
         else:
             print("VOICE >> MESSAGE TOO SHORT:", len(message), message)
 
@@ -423,6 +521,9 @@ class SRSRecorder:
         # checking is done here - https://github.com/ciribob/DCS-SimpleRadioStandalone/blob/c8f233a0eede26dc825499aa9dc86ccb4aa8df6d/DCS-SR-Client/Network/UDPVoiceHandler.cs#L326
         # we want all traffic for now
         return True
+
+    def audio_tick(self):
+        pass
 
 
 if __name__ == '__main__':
