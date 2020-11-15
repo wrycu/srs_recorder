@@ -8,6 +8,7 @@ import arrow
 import wave
 import scipy.io.wavfile
 import numpy
+import time
 
 MSG_UPDATE = 0
 MSG_PING = 1
@@ -150,17 +151,38 @@ class Radio:
         wave_file.setnchannels(2)
         wave_file.setframerate(self.sample_rate)
         wave_file.setsampwidth(2)
-        wave_file.close()
+        #wave_file.close()
 
         #self.out_file_handle = wave_file
-        self.out_file = out_file
+        self.out_file = wave_file
         self.receiving = False
+        self.started_receiving = False
         self.buffer = b''
         self.last_received_time = None
+        self.last_stream_ended = arrow.now()
 
     def write_audio(self, data):
+        self.out_file.writeframes(data)
         # this apparently appends by default (and manages the file being open/closed)
-        scipy.io.wavfile.write(self.out_file, self.sample_rate, numpy.frombuffer(data, dtype=float))
+        #scipy.io.wavfile.write(self.out_file, self.sample_rate, numpy.frombuffer(data, dtype=float))
+
+    def flush_buffer(self):
+        if self.buffer:
+            self.out_file.writeframes(self.buffer)
+            self.buffer = b''
+        #scipy.io.wavfile.write(self.out_file, self.sample_rate, numpy.frombuffer(self.buffer, dtype=float))
+
+    def generate_silence(self, duration):
+        bytes_per_sample = 2   # we always have this set to 2
+        channels = 2           # hard-coded for now. probably will need to update at some point
+        # number of bytes we need to fill for the difference between end and start times
+        silence_size = int(self.sample_rate * duration)
+        frame_size = channels * silence_size
+        output = b''
+        for i in range(0, frame_size):
+            output += b'0'
+
+        self.out_file.writeframes(output)
 
 
 class SRSRecorder:
@@ -229,6 +251,7 @@ class SRSRecorder:
         self.udp_socket_cmd = None
         self.radios = {}
         self.receiving = False
+        self.stop_audio_tick = False
 
     def __del__(self):
         pass
@@ -358,6 +381,7 @@ class SRSRecorder:
         self.connecting = False
         _thread.start_new_thread(self.spawn_udp_voice, ())
         _thread.start_new_thread(self.spawn_udp_cmd, ())
+        _thread.start_new_thread(self.audio_tick, ())
 
     def spawn_udp_cmd(self):
         """
@@ -452,19 +476,23 @@ class SRSRecorder:
                         # check if this is the first time we have seen this frequency and do some initial set up if so
                         if freq not in self.radios.keys():
                             self.radios[freq] = Radio(
-                                frequency=48000,
+                                frequency=freq,
                                 decoder=OpusDecoder(48000, 2, 'C:\\Program Files\\DCS-SimpleRadio-Standalone\\opus.dll'),
                                 out_file=str(freq) + '.wav',
                             )
-                            self.radios[freq].last_received_time = current_time
+                        self.radios[freq].last_received_time = current_time
                         # decode the (opus) packet
                         parsed_frames = self.radios[freq].opus_decoder.decode(parsed_voice)
+                        if not self.radios[freq].receiving:
+                            self.radios[freq].started_receiving = True
+                        self.radios[freq].receiving = True
                         if parsed_frames:
+                            self.radios[freq].buffer += parsed_frames
                             # write out the parsed frames
-                            self.radios[freq].write_audio(parsed_frames)
-                            if current_time != self.radios[freq].last_received_time:
-                                # this is not the first message; we may need to generate silence
-                                pass
+                            #self.radios[freq].write_audio(parsed_frames)
+                            #if current_time != self.radios[freq].last_received_time:
+                            #    # this is not the first message; we may need to generate silence
+                            #    pass
                         else:
                             # silence? something?
                             pass
@@ -523,7 +551,26 @@ class SRSRecorder:
         return True
 
     def audio_tick(self):
-        pass
+        while not self.stop_audio_tick:
+            for freq, radio in self.radios.items():
+                now = arrow.now()
+                # check if we've gone > 200ms since the last packet was received
+                # TODO: we need to figure out how and when silence should be added
+                time_delta = (now - radio.last_received_time).total_seconds()
+                if radio.receiving and time_delta > 0.2:
+                    print("AUDIO:: No longer receiving - flushing buffer")
+                    # update the radio state to indicate we are no longer receiving
+                    # since we're not currently _exactly_ thread safe, let's set this to false first in an attempt to
+                    #   avoid overriding the flag if we receive data while running this function
+                    radio.receiving = False
+                    # write out all of the data we've buffered
+                    radio.flush_buffer()
+                    radio.last_stream_ended = now
+                elif radio.receiving and radio.started_receiving:
+                    print("AUDIO:: STARTED RECEIVING NEW STREAM")
+                    # we have just started receiving a new stream
+                    radio.started_receiving = False
+                    radio.generate_silence((now - radio.last_stream_ended).total_seconds())
 
 
 if __name__ == '__main__':
