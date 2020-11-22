@@ -1,5 +1,6 @@
 import socket
 import time
+import arrow
 
 data = {
     'thanksgiving': [
@@ -180,16 +181,24 @@ def send_data(udp_sock, data):
 
 def send_thanksgiving():
     s = create_socket()
+    print("START transmission at", arrow.now())
     for packet in data['thanksgiving']:
         send_data(s, packet)
+    print("END transmission at", arrow.now())
 
 
 def send_another_burst():
     s = create_socket()
+    print("START transmission at", arrow.now())
     for packet in data['burst']:
         send_data(s, packet)
+    print("END transmission at", arrow.now())
 
 
+send_another_burst()
+time.sleep(5)
+send_thanksgiving()
+time.sleep(90)
 send_another_burst()
 time.sleep(5)
 send_thanksgiving()

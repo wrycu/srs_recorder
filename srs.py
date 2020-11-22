@@ -7,6 +7,7 @@ import array
 import arrow
 import wave
 import os
+import soundfile
 
 MSG_UPDATE = 0
 MSG_PING = 1
@@ -149,7 +150,7 @@ class Radio:
         wave_file.setnchannels(2)
         wave_file.setframerate(self.sample_rate)
         wave_file.setsampwidth(2)
-        self.out_file = wave_file
+        self.out_file = soundfile.SoundFile(out_file, 'wb', samplerate=48000, channels=1)
         self.receiving = False
         self.started_receiving = False
         self.buffer = b''
@@ -161,19 +162,30 @@ class Radio:
 
     def flush_buffer(self):
         if self.buffer:
-            self.out_file.writeframes(self.buffer)
+            self.out_file.buffer_write(self.buffer, 'int32')
+            self.out_file.flush()
             self.buffer = b''
 
     def generate_silence(self, duration):
-        channels = 2           # hard-coded for now. probably will need to update at some point
-        # number of bytes we need to fill for the difference between end and start times
-        silence_size = int(self.sample_rate * duration)
-        frame_size = channels * silence_size
-        output = b''
-        for i in range(0, frame_size):
-            output += b'0'
-
-        self.out_file.writeframes(output)
+        # the buffered write seems to fall flat with large amounts of write. although we shouldn't be calling with a
+        #  large duration, validate that assumption by only writing 5 seconds at a time
+        ms_silence = b'000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'
+        while duration > 5:
+            self.out_file.buffer_write(
+                ms_silence * int(5 * 1000 * 2),
+                'int32',
+            )
+            self.out_file.flush()
+            duration -= 5
+        # duration is seconds but we want ms so * 1000. the file expects two channels so * 2
+        self.out_file.buffer_write(
+            ms_silence * int(duration * 1000 * 2),
+            'int32',
+        )
+        # the docs have zero mention of when flush should be called - and in fact only mention write(),
+        #   not buffer_write()
+        # as such, we flush whenever we write to validate that we don't end up with missing data
+        self.out_file.flush()
 
 
 class SRSRecorder:
@@ -492,11 +504,13 @@ class SRSRecorder:
                             self.radios[freq] = Radio(
                                 frequency=freq,
                                 decoder=OpusDecoder(48000, 2, 'C:\\Program Files\\DCS-SimpleRadio-Standalone\\opus.dll'),
-                                out_file=str(freq) + '.wav',
+                                out_file=str(freq) + '.ogg',
                             )
                             # check if the mission has been running since before we heard audio on this freq and add it
                             #   if it has
-                            mission_start_delta = (arrow.now() - self.mission_start_time).total_seconds()
+                            if not self.mission_start_time:
+                                self.mission_start_time = current_time
+                            mission_start_delta = (current_time - self.mission_start_time).total_seconds()
                             if mission_start_delta:
                                 self.radios[freq].generate_silence(mission_start_delta)
                         self.radios[freq].last_received_time = current_time
@@ -504,9 +518,9 @@ class SRSRecorder:
                         parsed_frames = self.radios[freq].opus_decoder.decode(parsed_voice)
                         if not self.radios[freq].receiving:
                             self.radios[freq].started_receiving = True
-                        self.radios[freq].receiving = True
                         if parsed_frames:
                             self.radios[freq].buffer += parsed_frames
+                        self.radios[freq].receiving = True
             else:
                 print("VOICE >> DISCARDED INVALID MESSAGE:", message)
         else:
@@ -562,14 +576,17 @@ class SRSRecorder:
         return True
 
     def audio_tick(self):
+        last_tick = False
+        duration = 0
         while not self.stop_audio_tick:
             for freq, radio in self.radios.items():
                 now = arrow.now()
+                if not last_tick:
+                    last_tick = now
                 # check if we've gone > 200ms since the last packet was received
-                # TODO: we need to figure out how and when silence should be added
                 time_delta = (now - radio.last_received_time).total_seconds()
                 if radio.receiving and time_delta > 0.2:
-                    print("AUDIO:: No longer receiving - flushing buffer")
+                    print("AUDIO:: No longer receiving - flushing buffer", now)
                     # update the radio state to indicate we are no longer receiving
                     # since we're not currently _exactly_ thread safe, let's set this to false first in an attempt to
                     #   avoid overriding the flag if we receive data while running this function
@@ -578,10 +595,14 @@ class SRSRecorder:
                     radio.flush_buffer()
                     radio.last_stream_ended = now
                 elif radio.receiving and radio.started_receiving:
-                    print("AUDIO:: STARTED RECEIVING NEW STREAM")
+                    print("AUDIO:: Started receiving new stream", now, "| Silence duration was", duration, "seconds")
                     # we have just started receiving a new stream
                     radio.started_receiving = False
-                    radio.generate_silence((now - radio.last_stream_ended).total_seconds())
+                    duration = 0
+                elif not radio.receiving and (now - last_tick).total_seconds() >= 1:
+                    duration += (now - last_tick).total_seconds()
+                    radio.generate_silence((now - last_tick).total_seconds())
+                    last_tick = now
 
 
 if __name__ == '__main__':
