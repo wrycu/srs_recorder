@@ -154,7 +154,7 @@ class Radio:
         self.receiving = False
         self.started_receiving = False
         self.buffer = b''
-        self.last_received_time = None
+        self.last_received_time = arrow.now()
         self.last_stream_ended = arrow.now()
 
     def write_audio(self, data):
@@ -256,6 +256,10 @@ class SRSRecorder:
         self.receiving = False
         self.stop_audio_tick = False
         self.mission_start_time = None
+        rx_path = 'C:\\Program Files\\DCS-SimpleRadio-Standalone\\Radio-RX-1600.wav'
+        rx_file = wave.open(rx_path, 'rb')
+        self.rx = rx_file.readframes(9999)
+        rx_file.close()
 
     def __del__(self):
         print("AUDIO:: caught __del__")
@@ -386,8 +390,12 @@ class SRSRecorder:
         # testing telling SRS we are listening to a particular frequency
         self.state_blob['Client']['RadioInfo']['radios'][1]['freq'] = 305000000.0
         self.state_blob['Client']['RadioInfo']['radios'][1]['name'] = 'AN/ARC-210(V) AM'
-        self.state_blob['Client']['RadioInfo']['radios'][2]['modulation'] = 0
-        self.state_blob['Client']['RadioInfo']['radios'][3]['modulation'] = 1
+        self.state_blob['Client']['RadioInfo']['radios'][2]['freq'] = 422750000.0
+        self.state_blob['Client']['RadioInfo']['radios'][2]['name'] = 'AN/ARC-210(V) AM'
+        self.state_blob['Client']['RadioInfo']['radios'][3]['freq'] = 310000000.0
+        self.state_blob['Client']['RadioInfo']['radios'][3]['name'] = 'AN/ARC-210(V) AM'
+        #self.state_blob['Client']['RadioInfo']['radios'][2]['modulation'] = 0
+        #self.state_blob['Client']['RadioInfo']['radios'][3]['modulation'] = 1
         for x in range(0, 11):
             self.state_blob['Client']['RadioInfo']['radios'][x]['secFreq'] = 0.0
 
@@ -440,12 +448,6 @@ class SRSRecorder:
                 self.mission_start_time = arrow.now()
             elif message == b'MISSION_END':
                 print("Caught mission end")
-                # generate silence at the end of all recordings so they're the same length
-                now = arrow.now()
-                for freq, radio in self.radios:
-                    last_msg_delta = (now - radio.last_stream_ended).total_seconds()
-                    if last_msg_delta:
-                        radio.generate_silence(last_msg_delta)
                 os._exit(0)
 
     def spawn_udp_voice(self):
@@ -478,7 +480,6 @@ class SRSRecorder:
                 # this is called a ping in the docs. I haven't seen it happen yet though
                 print("caught ping or something lulz")
                 continue
-            print(message)
             self.parse_voice(message)
 
     def parse_voice(self, message):
@@ -599,6 +600,7 @@ class SRSRecorder:
                     # we have just started receiving a new stream
                     radio.started_receiving = False
                     duration = 0
+                    radio.buffer += self.rx
                 elif not radio.receiving and (now - last_tick).total_seconds() >= 1:
                     duration += (now - last_tick).total_seconds()
                     radio.generate_silence((now - last_tick).total_seconds())
