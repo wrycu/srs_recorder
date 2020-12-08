@@ -387,15 +387,17 @@ class SRSRecorder:
         self.state_blob['Client']['Coalition'] = 2
         self.state_blob['Client']['RadioInfo']['unit'] = 'A-10C'
         self.state_blob['Client']['RadioInfo']['radios'][1]['modulation'] = 0
-        # testing telling SRS we are listening to a particular frequency
+        self.state_blob['Client']['RadioInfo']['radios'][2]['modulation'] = 0
+        self.state_blob['Client']['RadioInfo']['radios'][3]['modulation'] = 0
+        # tell SRS we are listening to particular frequencies so we record traffic on all flight comms
+        # TODO: make a function to determine the radio (assuming it's enforced by SRS that certain radios can only hear
+        #  certain freqs)
         self.state_blob['Client']['RadioInfo']['radios'][1]['freq'] = 305000000.0
         self.state_blob['Client']['RadioInfo']['radios'][1]['name'] = 'AN/ARC-210(V) AM'
-        self.state_blob['Client']['RadioInfo']['radios'][2]['freq'] = 422750000.0
+        self.state_blob['Client']['RadioInfo']['radios'][2]['freq'] = 32000000.0
         self.state_blob['Client']['RadioInfo']['radios'][2]['name'] = 'AN/ARC-210(V) AM'
-        self.state_blob['Client']['RadioInfo']['radios'][3]['freq'] = 310000000.0
+        self.state_blob['Client']['RadioInfo']['radios'][3]['freq'] = 311000000.0
         self.state_blob['Client']['RadioInfo']['radios'][3]['name'] = 'AN/ARC-210(V) AM'
-        #self.state_blob['Client']['RadioInfo']['radios'][2]['modulation'] = 0
-        #self.state_blob['Client']['RadioInfo']['radios'][3]['modulation'] = 1
         for x in range(0, 11):
             self.state_blob['Client']['RadioInfo']['radios'][x]['secFreq'] = 0.0
 
@@ -580,31 +582,37 @@ class SRSRecorder:
         last_tick = False
         duration = 0
         while not self.stop_audio_tick:
-            for freq, radio in self.radios.items():
-                now = arrow.now()
-                if not last_tick:
-                    last_tick = now
-                # check if we've gone > 200ms since the last packet was received
-                time_delta = (now - radio.last_received_time).total_seconds()
-                if radio.receiving and time_delta > 0.2:
-                    print("AUDIO:: No longer receiving - flushing buffer", now)
-                    # update the radio state to indicate we are no longer receiving
-                    # since we're not currently _exactly_ thread safe, let's set this to false first in an attempt to
-                    #   avoid overriding the flag if we receive data while running this function
-                    radio.receiving = False
-                    # write out all of the data we've buffered
-                    radio.flush_buffer()
-                    radio.last_stream_ended = now
-                elif radio.receiving and radio.started_receiving:
-                    print("AUDIO:: Started receiving new stream", now, "| Silence duration was", duration, "seconds")
-                    # we have just started receiving a new stream
-                    radio.started_receiving = False
-                    duration = 0
-                    radio.buffer += self.rx
-                elif not radio.receiving and (now - last_tick).total_seconds() >= 1:
-                    duration += (now - last_tick).total_seconds()
-                    radio.generate_silence((now - last_tick).total_seconds())
-                    last_tick = now
+            try:
+                for freq, radio in self.radios.items():
+                    now = arrow.now()
+                    if not last_tick:
+                        last_tick = now
+                    # check if we've gone > 200ms since the last packet was received
+                    time_delta = (now - radio.last_received_time).total_seconds()
+                    if radio.receiving and time_delta > 0.2:
+                        print("AUDIO:: No longer receiving - flushing buffer", now)
+                        # update the radio state to indicate we are no longer receiving
+                        # since we're not currently _exactly_ thread safe, let's set this to false first in an attempt to
+                        #   avoid overriding the flag if we receive data while running this function
+                        radio.receiving = False
+                        # write out all of the data we've buffered
+                        radio.flush_buffer()
+                        radio.last_stream_ended = now
+                    elif radio.receiving and radio.started_receiving:
+                        print("AUDIO:: Started receiving new stream", now, "| Silence duration was", duration, "seconds")
+                        # we have just started receiving a new stream
+                        radio.started_receiving = False
+                        duration = 0
+                        radio.buffer += self.rx
+                    elif not radio.receiving and (now - last_tick).total_seconds() >= 1:
+                        duration += (now - last_tick).total_seconds()
+                        radio.generate_silence((now - last_tick).total_seconds())
+                        last_tick = now
+            except RuntimeError:
+                # Dictionary size changes based on the freqs we encounter
+                # we can address this by pre-loading the radios based on the number of freqs we're going to be listening
+                # to, but for now just pass
+                pass
 
 
 if __name__ == '__main__':
