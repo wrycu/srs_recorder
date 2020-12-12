@@ -119,7 +119,7 @@ class OpusDecoder:
             ctypes.c_int(self.frame_count),
             ctypes.c_int(0),
         )
-        return array.array('h', decoded_bytes[:decoded_byte_count * self.channels]).tobytes()
+        return array.array('h', decoded_bytes[:decoded_byte_count * self.channels]).tobytes(), decoded_byte_count / self.bitrate
 
     @staticmethod
     def get_frame_count(buffer_size):
@@ -155,7 +155,10 @@ class Radio:
         self.started_receiving = False
         self.buffer = b''
         self.last_received_time = arrow.now()
-        self.last_stream_ended = arrow.now()
+        self.last_stream_ended = None
+        self.stream_duration = 0
+        self.need_to_close_gap = True
+        self.last_tick = None
 
     def write_audio(self, data):
         self.out_file.writeframes(data)
@@ -350,7 +353,7 @@ class SRSRecorder:
                 return
         elif msg_type == MSG_RADIO_UPDATE:
             # I think this is sent when you slot?
-            print("got radio update:", msg)
+            #print("got radio update:", msg)
             pass
         elif msg_type == MSG_SERVER_SETTINGS:
             # sent when you first connect
@@ -446,8 +449,8 @@ class SRSRecorder:
         while True:
             message = udp_mission_sock.recv(65535)
             if message == b'MISSION_START' and not self.mission_start_time:
-                print("Caught mission start")
                 self.mission_start_time = arrow.now()
+                print("Caught mission start", self.mission_start_time)
             elif message == b'MISSION_END':
                 print("Caught mission end")
                 os._exit(0)
@@ -518,8 +521,14 @@ class SRSRecorder:
                                 self.radios[freq].generate_silence(mission_start_delta)
                         self.radios[freq].last_received_time = current_time
                         # decode the (opus) packet
-                        parsed_frames = self.radios[freq].opus_decoder.decode(parsed_voice)
+                        parsed_frames, decoded_length = self.radios[freq].opus_decoder.decode(parsed_voice)
+                        self.radios[freq].stream_duration += decoded_length
                         if not self.radios[freq].receiving:
+                            if self.radios[freq].last_tick and (current_time - self.radios[freq].last_tick).total_seconds() > 0:
+                                print("AUDIO:: Pre-generating {} seconds of silence".format(
+                                    (current_time - self.radios[freq].last_tick).total_seconds()))
+                                self.radios[freq].generate_silence(
+                                    (current_time - self.radios[freq].last_tick).total_seconds())
                             self.radios[freq].started_receiving = True
                         if parsed_frames:
                             self.radios[freq].buffer += parsed_frames
@@ -579,35 +588,44 @@ class SRSRecorder:
         return True
 
     def audio_tick(self):
-        last_tick = False
         duration = 0
         while not self.stop_audio_tick:
             try:
                 for freq, radio in self.radios.items():
                     now = arrow.now()
-                    if not last_tick:
-                        last_tick = now
-                    # check if we've gone > 200ms since the last packet was received
+                    if not radio.last_tick:
+                        radio.last_tick = now
                     time_delta = (now - radio.last_received_time).total_seconds()
+
+                    # check if we've gone > 200ms since the last packet was received
                     if radio.receiving and time_delta > 0.2:
-                        print("AUDIO:: No longer receiving - flushing buffer", now)
+                        print("AUDIO:: No longer receiving at {} | Stream duration was {}".format(now, radio.stream_duration))
                         # update the radio state to indicate we are no longer receiving
-                        # since we're not currently _exactly_ thread safe, let's set this to false first in an attempt to
-                        #   avoid overriding the flag if we receive data while running this function
+                        # since we're not currently _exactly_ thread safe, let's set this to false first in an attempt
+                        #   to avoid overriding the flag if we receive data while running this function
+                        radio.stream_duration = 0
                         radio.receiving = False
                         # write out all of the data we've buffered
                         radio.flush_buffer()
-                        radio.last_stream_ended = now
+                        radio.last_stream_ended = now.shift(seconds=-time_delta)
                     elif radio.receiving and radio.started_receiving:
                         print("AUDIO:: Started receiving new stream", now, "| Silence duration was", duration, "seconds")
+                        print("AUDIO:: New stream was", now - self.mission_start_time, "from start of mission")
                         # we have just started receiving a new stream
                         radio.started_receiving = False
                         duration = 0
-                        radio.buffer += self.rx
-                    elif not radio.receiving and (now - last_tick).total_seconds() >= 1:
-                        duration += (now - last_tick).total_seconds()
-                        radio.generate_silence((now - last_tick).total_seconds())
-                        last_tick = now
+                        #radio.buffer += self.rx
+                    elif not radio.started_receiving and not radio.receiving and (now - radio.last_tick).total_seconds() >= 1:
+                        duration += (now - radio.last_tick).total_seconds()
+                        if radio.last_stream_ended:
+                            print("AUDIO:: Generating {} seconds of silence".format((now - radio.last_stream_ended).total_seconds()))
+                            radio.generate_silence((now - radio.last_stream_ended).total_seconds())
+                            radio.last_stream_ended = None
+                            radio.last_tick = now
+                        else:
+                            print("AUDIO:: Generating {} seconds of silence".format((now - radio.last_tick).total_seconds()))
+                            radio.generate_silence((now - radio.last_tick).total_seconds())
+                        radio.last_tick = now
             except RuntimeError:
                 # Dictionary size changes based on the freqs we encounter
                 # we can address this by pre-loading the radios based on the number of freqs we're going to be listening
