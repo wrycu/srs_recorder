@@ -10,7 +10,7 @@ SRS_RECORDER.logFile = io.open(
 )
 function SRS_RECORDER.log(str)
     if SRS_RECORDER.logFile then
-        SRS_RECORDER.logFile:write(str.."\n")
+        SRS_RECORDER.logFile:write(os.date() .. " | " .. str .."\r\n")
         SRS_RECORDER.logFile.flush()
     end
 end

@@ -1,6 +1,7 @@
 import socket
 import json
 import _thread
+import threading
 import struct
 import ctypes
 import array
@@ -139,6 +140,7 @@ class Radio:
     Intended to track all data related to a given frequency for SRS
     """
     def __init__(self, frequency, decoder, out_file):
+        now = arrow.now()
         self.sample_rate = 48000  # this should probably be specified upstream, but for now we know it'll be 48,000
         self.frequency = frequency
         # decoder should be an OpusDecoder object
@@ -154,11 +156,17 @@ class Radio:
         self.receiving = False
         self.started_receiving = False
         self.buffer = b''
-        self.last_received_time = arrow.now()
+        self.last_received_time = now
         self.last_stream_ended = None
-        self.stream_duration = 0
         self.need_to_close_gap = True
         self.last_tick = None
+        self.lock = threading.Lock()
+        self.received_audio = False
+        # TODO we will fix last_received_time and last_received_start at 2000 after jeremy works in tomorrow
+        self.last_rx = None
+        self.last_rx_extended = None
+        self.ms_silence = b'000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'
+        self.previous_delta = 0
 
     def write_audio(self, data):
         self.out_file.writeframes(data)
@@ -172,17 +180,16 @@ class Radio:
     def generate_silence(self, duration):
         # the buffered write seems to fall flat with large amounts of write. although we shouldn't be calling with a
         #  large duration, validate that assumption by only writing 5 seconds at a time
-        ms_silence = b'000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'
         while duration > 5:
             self.out_file.buffer_write(
-                ms_silence * int(5 * 1000 * 2),
+                self.ms_silence * int(5 * 1000 * 2),
                 'int32',
             )
             self.out_file.flush()
             duration -= 5
         # duration is seconds but we want ms so * 1000. the file expects two channels so * 2
         self.out_file.buffer_write(
-            ms_silence * int(duration * 1000 * 2),
+            self.ms_silence * (int((round(duration, 2) + 0.001) * 1000 * 2)),
             'int32',
         )
         # the docs have zero mention of when flush should be called - and in fact only mention write(),
@@ -192,15 +199,45 @@ class Radio:
 
 
 class SRSRecorder:
-    def __init__(self):
-        self.host = '127.0.0.1'
-        self.port = 5002
-        self.nick = 'RECORDER'
+    """
+    An object used to record select frequencies on an SRS server. Intended to be used in conjunction with TacView for
+        better debriefs
+    """
+    def __init__(self, freqs, **kwargs):
+        """
+        Initializes the recorder
+        :param freqs:
+            A list of frequencies to record. Each frequency must be a number.
+            The format is expected as:
+                305 (for 305.000Mhz)
+        :param kwargs:
+            Optional arguments. These have sane defaults, but can be overridden if so desired.
+            srs_ip
+                IP address of the SRS server. Note that currently only 127.0.0.1 is supported
+            srs_port
+                port SRS is listening on. SRS defaults to 5002, so unless the server changed it this should be fine
+            srs_nick
+                Username to send to SRS. Displayed to the server admin (and no one else so far as I know)
+            rx_sfx
+                Path to a file to play as the receiving audio effect. Defaults to the normal SRS sound, but can be
+                    anything
+            opus_dll
+                Path to an Opus DLL capable of decoding Opus packets. Defaults to the file used by SRS.
+                You should not change this unless you're sure that you know what you're doing... and that I do.
+                In short, probably don't change this unless you installed SRS to a non-default location.
+            sample_rate
+                Sample rate used to write audio. Highly recommend you do not change this as it's what SRS uses and
+                    I'm not entirely sure that Opus will appreciate anything but that.
+        """
+        self.host = kwargs.get('srs_ip', '127.0.0.1')
+        self.port = kwargs.get('srs_port', 5002)
+        self.nick = kwargs.get('srs_nick', 'SRS_RECORDER')
         self.version = '1.9.2.1'
-        # this is the ID used on the SRS network. I changed a single character in mine. No idea if it's unique
-        #   or even if it needs to be. Hope stuff works :)
+        # this is the ID used on the SRS network. I changed a single character in mine. No idea if it's unique or even
+        #   if it needs to be
         self.client_guid = 'Cg1jAqxRakO0NxsDQnCcpg'
-        # track the server settings. Not really used now, but could come in handy in the long term
+        # Default server settings to what I observed on my server.
+        # Not currently used, but could be in the future...
         self.server_settings = {
             'CLIENT_EXPORT_ENABLED': False,
             'EXTERNAL_AWACS_MODE': False,
@@ -221,7 +258,6 @@ class SRSRecorder:
             'SHOW_TRANSMITTER_NAME': False,
             'RETRANSMISSION_NODE_LIMIT': 0,
         }
-        self.tcp_socket = None
         self.connected_clients = []
         # track our own state. Sometimes sent to the SRS server to update it on where we are and all that jazz
         self.state_blob = {
@@ -253,16 +289,36 @@ class SRSRecorder:
             "Version": self.version,
         }
         self.connecting = True
-        self.udp_socket_voice = None
-        self.udp_socket_cmd = None
         self.radios = {}
         self.receiving = False
-        self.stop_audio_tick = False
-        self.mission_start_time = None
-        rx_path = 'C:\\Program Files\\DCS-SimpleRadio-Standalone\\Radio-RX-1600.wav'
-        rx_file = wave.open(rx_path, 'rb')
+        self.stop_audio_tick = True
+        # default mission start time to SOMETHING in case we miss the mission start
+        self.mission_start_time = arrow.now()
+        # we preload the RX sounds to cut down on latency later
+        rx_file = wave.open(
+            kwargs.get('srx_file', 'C:\\Program Files\\DCS-SimpleRadio-Standalone\\Radio-RX-1600.wav'),
+            'rb'
+        )
         self.rx = rx_file.readframes(9999)
         rx_file.close()
+        # Opus DLL path
+        self.opus_dll = kwargs.get('opus_dll', 'C:\\Program Files\\DCS-SimpleRadio-Standalone\\opus.dll')
+        if not os.path.exists(self.opus_dll):
+            raise Exception("Could not find Opus DLL - try installing SRS?")
+            os._exit(1)
+        # set the sample rate
+        self.sample_rate = kwargs.get('sample_rate', 48000)
+        # set the frequencies we want to listen to
+        try:
+            self.freqs = [x * 1000000 for x in freqs]
+        except Exception:
+            raise Exception("Invalid frequencies were detected. Note that frequencies should be numerical")
+            os._exit(2)
+        # set up sockets for communication with the server
+        self.tcp_socket = None
+        self.udp_socket_voice = None
+        self.udp_socket_cmd = None
+        self.packet_log = open('packets.txt', 'wb')
 
     def __del__(self):
         print("AUDIO:: caught __del__")
@@ -389,18 +445,16 @@ class SRSRecorder:
         self.state_blob['MsgType'] = MSG_RADIO_UPDATE
         self.state_blob['Client']['Coalition'] = 2
         self.state_blob['Client']['RadioInfo']['unit'] = 'A-10C'
-        self.state_blob['Client']['RadioInfo']['radios'][1]['modulation'] = 0
-        self.state_blob['Client']['RadioInfo']['radios'][2]['modulation'] = 0
-        self.state_blob['Client']['RadioInfo']['radios'][3]['modulation'] = 0
         # tell SRS we are listening to particular frequencies so we record traffic on all flight comms
-        # TODO: make a function to determine the radio (assuming it's enforced by SRS that certain radios can only hear
-        #  certain freqs)
-        self.state_blob['Client']['RadioInfo']['radios'][1]['freq'] = 305000000.0
-        self.state_blob['Client']['RadioInfo']['radios'][1]['name'] = 'AN/ARC-210(V) AM'
-        self.state_blob['Client']['RadioInfo']['radios'][2]['freq'] = 32000000.0
-        self.state_blob['Client']['RadioInfo']['radios'][2]['name'] = 'AN/ARC-210(V) AM'
-        self.state_blob['Client']['RadioInfo']['radios'][3]['freq'] = 311000000.0
-        self.state_blob['Client']['RadioInfo']['radios'][3]['name'] = 'AN/ARC-210(V) AM'
+        for i, freq in enumerate(self.freqs):
+            self.state_blob['Client']['RadioInfo']['radios'][i + 1]['freq'] = freq
+            self.state_blob['Client']['RadioInfo']['radios'][i + 1]['name'] = 'AN/ARC-210(V) AM'
+            self.state_blob['Client']['RadioInfo']['radios'][i + 1]['modulation'] = 0
+            self.radios[freq] = Radio(
+                frequency=freq,
+                decoder=OpusDecoder(self.sample_rate, 2, self.opus_dll),
+                out_file=str(freq) + '.ogg',
+            )
         for x in range(0, 11):
             self.state_blob['Client']['RadioInfo']['radios'][x]['secFreq'] = 0.0
 
@@ -408,7 +462,6 @@ class SRSRecorder:
         self.connecting = False
         _thread.start_new_thread(self.spawn_udp_voice, ())
         _thread.start_new_thread(self.spawn_udp_cmd, ())
-        _thread.start_new_thread(self.audio_tick, ())
         _thread.start_new_thread(self.spawn_mission_tracker, ())
 
     def spawn_udp_cmd(self):
@@ -421,7 +474,7 @@ class SRSRecorder:
             N/A
         """
         self.udp_socket_cmd = socket.socket(family=socket.AF_INET, type=socket.SOCK_RAW, proto=socket.IPPROTO_UDP)
-        self.udp_socket_cmd.sendto('hello'.encode(), (self.host, 5002))
+        self.udp_socket_cmd.sendto('hello'.encode(), (self.host, self.port))
         while True:
             message, address = self.udp_socket_cmd.recvfrom(65535)
             if message[28:32] == b'abcd':
@@ -448,12 +501,16 @@ class SRSRecorder:
         udp_mission_sock.bind(('127.0.0.1', 5190))
         while True:
             message = udp_mission_sock.recv(65535)
-            if message == b'MISSION_START' and not self.mission_start_time:
+            if message == b'MISSION_START':
                 self.mission_start_time = arrow.now()
-                print("Caught mission start", self.mission_start_time)
+                self.print("command", f"Caught mission start at {arrow.now()}")
+                if self.stop_audio_tick:
+                    self.stop_audio_tick = False
+                    _thread.start_new_thread(self.audio_tick, ())
             elif message == b'MISSION_END':
-                print("Caught mission end")
-                os._exit(0)
+                self.print("command", "Caught mission end")
+                self.packet_log.close()
+                self.stop_audio_tick = True
 
     def spawn_udp_voice(self):
         """
@@ -463,7 +520,7 @@ class SRSRecorder:
         """
         print("Spawned UDP listener")
         self.udp_socket_voice = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM, proto=socket.IPPROTO_UDP)
-        self.udp_socket_voice.sendto(self.client_guid.encode(), (self.host, 5002))
+        self.udp_socket_voice.sendto(self.client_guid.encode(), (self.host, self.port))
         message, address = self.udp_socket_voice.recvfrom(65535)
         print("Initial sync:", message, address)
         self.read_udp()
@@ -505,33 +562,34 @@ class SRSRecorder:
                 if parsed_voice:
                     # a single packet can contain multiple frequencies worth of data
                     for freq in parsed_voice['frequencies']:
-                        # check if this is the first time we have seen this frequency and do some initial set up if so
-                        if freq not in self.radios.keys():
-                            self.radios[freq] = Radio(
-                                frequency=freq,
-                                decoder=OpusDecoder(48000, 2, 'C:\\Program Files\\DCS-SimpleRadio-Standalone\\opus.dll'),
-                                out_file=str(freq) + '.ogg',
-                            )
-                            # check if the mission has been running since before we heard audio on this freq and add it
-                            #   if it has
-                            if not self.mission_start_time:
-                                self.mission_start_time = current_time
-                            mission_start_delta = (current_time - self.mission_start_time).total_seconds()
-                            if mission_start_delta:
-                                self.radios[freq].generate_silence(mission_start_delta)
-                        self.radios[freq].last_received_time = current_time
                         # decode the (opus) packet
                         parsed_frames, decoded_length = self.radios[freq].opus_decoder.decode(parsed_voice)
-                        self.radios[freq].stream_duration += decoded_length
+                        #self.radios[freq].last_received_time = current_time.shift(seconds=decoded_length)
+                        self.radios[freq].last_rx = current_time
+                        self.radios[freq].last_rx_extended = current_time.shift(seconds=decoded_length)
                         if not self.radios[freq].receiving:
-                            if self.radios[freq].last_tick and (current_time - self.radios[freq].last_tick).total_seconds() > 0:
-                                print("AUDIO:: Pre-generating {} seconds of silence".format(
-                                    (current_time - self.radios[freq].last_tick).total_seconds()))
-                                self.radios[freq].generate_silence(
-                                    (current_time - self.radios[freq].last_tick).total_seconds())
+                            # we have begun to receive a new stream, generate silence to fill the gap before it started
+                            duration = (current_time - self.radios[freq].last_tick).total_seconds()
+                            if self.radios[freq].last_tick and duration > 0:
+                                if not self.radios[freq].received_audio:
+                                    # we do not pre-generate silence on the first stream
+                                    self.radios[freq].received_audio = True
+                                    #self.radios[freq].lock.acquire()
+                                    #self.radios[freq].generate_silence((current_time - self.mission_start_time).total_seconds())
+                                    self.print('audio', f'Detected first audio stream on {freq}',self.radios[freq])
+                                    #self.radios[freq].lock.release()
+                                else:
+                                    # pre-generate silence before the stream begins
+                                    self.radios[freq].lock.acquire()
+                                    self.radios[freq].generate_silence(duration)
+                                    self.print('audio', f'Pre-generating {duration} seconds of silence', self.radios[freq])
+                                    self.radios[freq].lock.release()
+                            # update the radio to indicate that a new stream has begun
                             self.radios[freq].started_receiving = True
                         if parsed_frames:
+                            self.radios[freq].lock.acquire()
                             self.radios[freq].buffer += parsed_frames
+                            self.radios[freq].lock.release()
                         self.radios[freq].receiving = True
             else:
                 print("VOICE >> DISCARDED INVALID MESSAGE:", message)
@@ -588,51 +646,80 @@ class SRSRecorder:
         return True
 
     def audio_tick(self):
-        duration = 0
         while not self.stop_audio_tick:
-            try:
-                for freq, radio in self.radios.items():
-                    now = arrow.now()
-                    if not radio.last_tick:
-                        radio.last_tick = now
-                    time_delta = (now - radio.last_received_time).total_seconds()
+            for freq, radio in self.radios.items():
+                now = arrow.now()
+                if not radio.last_tick:
+                    radio.last_tick = now
+                tick_delta = (now - radio.last_tick).total_seconds()
+                if radio.last_rx:
+                    rx_delta = (now - radio.last_rx).total_seconds()
+                    rx_extended_delta = (now - radio.last_rx_extended).total_seconds()
+                else:
+                    rx_delta = 0
+                    rx_extended_delta = 0
 
-                    # check if we've gone > 200ms since the last packet was received
-                    if radio.receiving and time_delta > 0.2:
-                        print("AUDIO:: No longer receiving at {} | Stream duration was {}".format(now, radio.stream_duration))
-                        # update the radio state to indicate we are no longer receiving
-                        # since we're not currently _exactly_ thread safe, let's set this to false first in an attempt
-                        #   to avoid overriding the flag if we receive data while running this function
-                        radio.stream_duration = 0
-                        radio.receiving = False
-                        # write out all of the data we've buffered
-                        radio.flush_buffer()
-                        radio.last_stream_ended = now.shift(seconds=-time_delta)
-                    elif radio.receiving and radio.started_receiving:
-                        print("AUDIO:: Started receiving new stream", now, "| Silence duration was", duration, "seconds")
-                        print("AUDIO:: New stream was", now - self.mission_start_time, "from start of mission")
-                        # we have just started receiving a new stream
-                        radio.started_receiving = False
-                        duration = 0
-                        #radio.buffer += self.rx
-                    elif not radio.started_receiving and not radio.receiving and (now - radio.last_tick).total_seconds() >= 1:
-                        duration += (now - radio.last_tick).total_seconds()
-                        if radio.last_stream_ended:
-                            print("AUDIO:: Generating {} seconds of silence".format((now - radio.last_stream_ended).total_seconds()))
-                            radio.generate_silence((now - radio.last_stream_ended).total_seconds())
-                            radio.last_stream_ended = None
-                            radio.last_tick = now
+                if radio.receiving and radio.started_receiving:
+                    # we have just started receiving a new stream
+                    self.print(
+                        "audio",
+                        f"Started receiving new stream",
+                        radio,
+                    )
+                    radio.started_receiving = False
+                    # based on test playbacks, this might not even be needed...
+                    # radio.buffer += self.rx
+                elif radio.receiving and rx_delta > 0.2:
+                    # it's been >= 200 ms since we last received a packet, update state to show the stream is over
+                    radio.receiving = False
+                    # write out all of the data we've buffered
+                    radio.lock.acquire()
+                    radio.flush_buffer()
+                    # this generation may not even be needed now that we're doing constant error correcting
+                    silence_needed = round(len(radio.out_file) / radio.out_file.samplerate - (arrow.now() - self.mission_start_time).total_seconds(), 4) * -1
+                    if silence_needed > 0:
+                        radio.generate_silence(silence_needed)
+                        self.print("audio", f"ERROR CORRECTING with {silence_needed} seconds of one-off silence ;););)", radio)
+                    radio.lock.release()
+                    radio.last_rx = None
+                    radio.last_rx_extended = None
+                    radio.last_tick = now
+                elif not radio.started_receiving and not radio.receiving and tick_delta >= 1:
+                    # we're not receiving and it's been that way for >= 1 second
+                    if not radio.last_rx:
+                        # check if we've run out of sync and attempt to put us back
+                        time_elapsed = (arrow.now() - self.mission_start_time).total_seconds()
+                        recording_delta = round(len(radio.out_file) / radio.out_file.samplerate - time_elapsed, 4)
+                        radio.lock.acquire()
+                        if recording_delta < 0:
+                            # stop trying to be smart and just close the gap
+                            radio.generate_silence(recording_delta * -1)
+                            self.print("audio", f"Generating {recording_delta * -1} seconds of silence", radio)
                         else:
-                            print("AUDIO:: Generating {} seconds of silence".format((now - radio.last_tick).total_seconds()))
-                            radio.generate_silence((now - radio.last_tick).total_seconds())
-                        radio.last_tick = now
-            except RuntimeError:
-                # Dictionary size changes based on the freqs we encounter
-                # we can address this by pre-loading the radios based on the number of freqs we're going to be listening
-                # to, but for now just pass
-                pass
+                            self.print("audio", "Skipping silence generation as we're ahead", radio)
+                        radio.lock.release()
+                    radio.last_tick = now
+        os._exit(0)
+
+    def print(self, group, message, radio=None):
+        if self.mission_start_time:
+            delta = (arrow.now() - self.mission_start_time).total_seconds()
+            if radio:
+                delta = round(len(radio.out_file) / radio.out_file.samplerate - delta, 4)
+                print(f"{group.upper()}:: [t+{(arrow.now() - self.mission_start_time).total_seconds()} | r+{len(radio.out_file) / radio.out_file.samplerate} | d={delta}, dd={round(delta - radio.previous_delta, 2)}] {message}")
+                radio.previous_delta = delta
+            else:
+                print(f"{group.upper()}:: [t+{(arrow.now() - self.mission_start_time).total_seconds()}] {message}")
+        else:
+            print(f"{group.upper()}:: {message}")
 
 
 if __name__ == '__main__':
-    recorder = SRSRecorder()
+    recorder = SRSRecorder(
+        freqs=[
+            229.000,
+            #320.000,
+            #311.000,
+        ],
+    )
     recorder.connect()
