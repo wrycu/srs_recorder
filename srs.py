@@ -226,12 +226,13 @@ class SRSRecorder:
             },
             'recorder': {
                 'opus_dll': config.get('recorder', 'opus_dll'),
-                'freqs': [],
+                'freqs': config.get('recorder', 'freq').split(','),
+                'output': config.get('recorder', 'output'),
             },
-            'freqs': config.get('recorder', 'freq').split(',')
         }
 
-        freqs = [float(x) for x in conf['freqs']]
+        self.output_dir = conf['recorder']['output']
+        freqs = [float(x) for x in conf['recorder']['freqs']]
         self.host = conf['srs']['ip']
         self.port = int(conf['srs']['port'])
         self.nick = conf['srs']['nick']
@@ -456,7 +457,7 @@ class SRSRecorder:
             self.radios[freq] = Radio(
                 frequency=freq,
                 decoder=OpusDecoder(self.sample_rate, 2, self.opus_dll),
-                out_file=str(freq) + '.ogg',
+                out_file=os.path.join(self.output_dir, str(freq / 1000000) + '.ogg'),
             )
         for x in range(0, 11):
             self.state_blob['Client']['RadioInfo']['radios'][x]['secFreq'] = 0.0
