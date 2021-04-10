@@ -9,6 +9,7 @@ import arrow
 import wave
 import os
 import soundfile
+import configparser
 
 MSG_UPDATE = 0
 MSG_PING = 1
@@ -203,39 +204,41 @@ class SRSRecorder:
     An object used to record select frequencies on an SRS server. Intended to be used in conjunction with TacView for
         better debriefs
     """
-    def __init__(self, freqs, **kwargs):
+    def __init__(self, **kwargs):
         """
         Initializes the recorder
-        :param freqs:
-            A list of frequencies to record. Each frequency must be a number.
-            The format is expected as:
-                305 (for 305.000Mhz)
         :param kwargs:
-            Optional arguments. These have sane defaults, but can be overridden if so desired.
-            srs_ip
-                IP address of the SRS server. Note that currently only 127.0.0.1 is supported
-            srs_port
-                port SRS is listening on. SRS defaults to 5002, so unless the server changed it this should be fine
-            srs_nick
-                Username to send to SRS. Displayed to the server admin (and no one else so far as I know)
-            rx_sfx
-                Path to a file to play as the receiving audio effect. Defaults to the normal SRS sound, but can be
-                    anything
-            opus_dll
-                Path to an Opus DLL capable of decoding Opus packets. Defaults to the file used by SRS.
-                You should not change this unless you're sure that you know what you're doing... and that I do.
-                In short, probably don't change this unless you installed SRS to a non-default location.
+            Optional arguments.
             sample_rate
                 Sample rate used to write audio. Highly recommend you do not change this as it's what SRS uses and
                     I'm not entirely sure that Opus will appreciate anything but that.
         """
-        self.host = kwargs.get('srs_ip', '127.0.0.1')
-        self.port = kwargs.get('srs_port', 5002)
-        self.nick = kwargs.get('srs_nick', 'SRS_RECORDER')
-        self.version = '1.9.2.1'
+        config = configparser.ConfigParser()
+        config.read(kwargs.get('conf', 'config.ini'))
+        conf = {
+            'srs': {
+                'ip': config.get('srs', 'ip'),
+                'port': config.get('srs', 'port'),
+                'nick': config.get('srs', 'nick'),
+                'version': config.get('srs', 'version'),
+                'guid': config.get('srs', 'guid'),
+                'rx': config.get('srs', 'rx'),
+            },
+            'recorder': {
+                'opus_dll': config.get('recorder', 'opus_dll'),
+                'freqs': [],
+            },
+            'freqs': config.get('recorder', 'freq').split(',')
+        }
+
+        freqs = [float(x) for x in conf['freqs']]
+        self.host = conf['srs']['ip']
+        self.port = int(conf['srs']['port'])
+        self.nick = conf['srs']['nick']
+        self.version = conf['srs']['version']
         # this is the ID used on the SRS network. I changed a single character in mine. No idea if it's unique or even
         #   if it needs to be
-        self.client_guid = 'Cg1jAqxRakO0NxsDQnCcpg'
+        self.client_guid = conf['srs']['guid']
         # Default server settings to what I observed on my server.
         # Not currently used, but could be in the future...
         self.server_settings = {
@@ -296,13 +299,13 @@ class SRSRecorder:
         self.mission_start_time = arrow.now()
         # we preload the RX sounds to cut down on latency later
         rx_file = wave.open(
-            kwargs.get('srx_file', 'C:\\Program Files\\DCS-SimpleRadio-Standalone\\Radio-RX-1600.wav'),
+            conf['srs']['rx'],
             'rb'
         )
         self.rx = rx_file.readframes(9999)
         rx_file.close()
         # Opus DLL path
-        self.opus_dll = kwargs.get('opus_dll', 'C:\\Program Files\\DCS-SimpleRadio-Standalone\\opus.dll')
+        self.opus_dll = conf['recorder']['opus_dll']
         if not os.path.exists(self.opus_dll):
             raise Exception("Could not find Opus DLL - try installing SRS?")
             os._exit(1)
@@ -349,7 +352,7 @@ class SRSRecorder:
                 'secFreq': 1.0,
                 'retransmit': False,
             })
-
+        # TODO: handle being unable to connect to SRS server
         self.tcp_socket = socket.socket()
         self.tcp_socket.connect((self.host, self.port))
         self.tcp_socket.sendall(json.dumps(connect_blob, separators=(',', ':')).encode() + '\n'.encode())
@@ -715,11 +718,5 @@ class SRSRecorder:
 
 
 if __name__ == '__main__':
-    recorder = SRSRecorder(
-        freqs=[
-            229.000,
-            #320.000,
-            #311.000,
-        ],
-    )
+    recorder = SRSRecorder()
     recorder.connect()

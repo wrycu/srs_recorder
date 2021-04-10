@@ -14,10 +14,10 @@ function SRS_RECORDER.log(str)
         SRS_RECORDER.logFile.flush()
     end
 end
-
+SRS_RECORDER.log("SRS_RECORDER loading")
 -- used to trigger recording once we load and to stop it once we're done
 local socket = require("socket")
-
+SRS_RECORDER.UDPSendSocket = socket.udp()
 SRS_RECORDER.log("SRS_RECORDER loaded")
 
 LuaExportStop = function()
@@ -30,7 +30,6 @@ function LuaExportActivityNextEvent(t)
     tNext = tNext + 0.1
     local _data = LoGetSelfData()
     if (_data ~= nil and SRS_RECORDER.SLOTTED == false) then
-        SRS_RECORDER.log(LoGetModelTime())
         if LoGetModelTime() > 0 then
             SRS_RECORDER.log("SRS_RECORDER CAUGHT SLOT")
             socket.try(SRS_RECORDER.UDPSendSocket:sendto("MISSION_START", SRS_RECORDER.SEND_IP, SRS_RECORDER.SEND_PORT))

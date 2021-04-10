@@ -1,0 +1,12 @@
+[srs]
+ip:       127.0.0.1
+port:     5002
+nick:     SRS_RECORDER
+version:  1.9.5.0
+guid:     Cg1jAqxRakO0NxsDQnCcpg
+rx:       C:\Program Files\DCS-SimpleRadio-Standalone\Radio-RX-1600.wav
+
+[recorder]
+opus_dll: C:\Program Files\DCS-SimpleRadio-Standalone\opus.dll
+freq:     305.000, 422.750
+output:   C:\Users\Tim\Documents\Tacview\srs
