@@ -718,6 +718,50 @@ class SRSRecorder:
             print(f"{group.upper()}:: {message}")
 
 
+class Environment:
+    def __init__(self):
+        pass
+
+    def get_install_paths(self):
+        install_paths = []
+        check_paths = ['DCS.openbeta', 'DCS']
+        base_path = os.path.expandvars('%USERPROFILE%') + '\\Saved Games'
+
+        for path in check_paths:
+            cur_path = base_path + '\\' + path
+            if os.path.exists(cur_path):
+                install_paths.append(cur_path)
+
+        return install_paths
+
+    def populate_export(self, path):
+        import shutil
+        destination_path = path + '\\Scripts\\srs_recorder.lua'
+        if not os.path.isfile(destination_path):
+            print("Couldn't find srs_recorder.lua, installing")
+            # copy the recorder file (done first so if it fails we don't muck with the export.lua file)
+            shutil.copyfile('scripts\\srs_recorder.lua', path + '\\Scripts\\srs_recorder.lua')
+            # validate that the export file exists at all
+            export_file = path + '\\Scripts\\Export.lua'
+            mode = 'a'
+            if not os.path.isfile(export_file):
+                mode = 'w'
+            # make a backup of the file before we mess things up
+            shutil.copyfile(export_file, export_file + '.srs_recorder_backup')
+            in_fh = open('scripts\\export.lua', 'r')
+            contents = in_fh.readlines()
+            with open(export_file, mode) as export_fh:
+                export_fh.writelines(contents)
+            print("Install completed")
+
+    def configure(self):
+        paths = self.get_install_paths()
+        for path in paths:
+            self.populate_export(path)
+
+
 if __name__ == '__main__':
+    e = Environment()
+    e.configure()
     recorder = SRSRecorder()
     recorder.connect()
