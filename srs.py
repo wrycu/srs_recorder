@@ -149,6 +149,9 @@ class Radio:
         self.opus_decoder.create()
         # for testing, we want to overwrite existing recordings. This will probably get removed as the project matures
         # zero out the file (yes there are easier ways to do it)
+        if not os.path.exists(out_file):
+            print("ERROR:: Audio recording path not found, please select an existing path")
+            exit(5)
         wave_file = wave.open(out_file, 'wb')
         wave_file.setnchannels(2)
         wave_file.setframerate(self.sample_rate)
@@ -299,6 +302,9 @@ class SRSRecorder:
         # default mission start time to SOMETHING in case we miss the mission start
         self.mission_start_time = arrow.now()
         # we preload the RX sounds to cut down on latency later
+        if not os.path.exists(conf['srs']['rx']):
+            print("ERROR:: Could not find RX sound file, please check the configuration")
+            exit(6)
         rx_file = wave.open(
             conf['srs']['rx'],
             'rb'
@@ -308,7 +314,7 @@ class SRSRecorder:
         # Opus DLL path
         self.opus_dll = conf['recorder']['opus_dll']
         if not os.path.exists(self.opus_dll):
-            raise Exception("Could not find Opus DLL - try installing SRS?")
+            print("ERROR:: Could not find Opus DLL - try installing SRS?")
             os._exit(1)
         # set the sample rate
         self.sample_rate = kwargs.get('sample_rate', 48000)
@@ -316,7 +322,7 @@ class SRSRecorder:
         try:
             self.freqs = [x * 1000000 for x in freqs]
         except Exception:
-            raise Exception("Invalid frequencies were detected. Note that frequencies should be numerical")
+            raise Exception("ERROR:: Invalid frequencies were detected. Note that frequencies should be numerical")
             os._exit(2)
         # set up sockets for communication with the server
         self.tcp_socket = None
@@ -325,14 +331,12 @@ class SRSRecorder:
         self.packet_log = open('packets.txt', 'wb')
 
     def __del__(self):
-        print("AUDIO:: caught __del__")
         for freq, radio in self.radios.items():
             now = arrow.now()
             radio.generate_silence((now - radio.last_stream_ended).total_seconds())
             radio.out_file.close()
 
     def __exit__(self):
-        print("AUDIO:: caught __exit__")
         for freq, radio in self.radios.items():
             now = arrow.now()
             radio.generate_silence((now - radio.last_stream_ended).total_seconds())
@@ -355,8 +359,13 @@ class SRSRecorder:
             })
         # TODO: handle being unable to connect to SRS server
         self.tcp_socket = socket.socket()
-        self.tcp_socket.connect((self.host, self.port))
+        try:
+            self.tcp_socket.connect((self.host, self.port))
+        except ConnectionRefusedError:
+            print("ERROR:: Unable to connect to SRS server, validate the IP address and port are correct")
+            exit(2)
         self.tcp_socket.sendall(json.dumps(connect_blob, separators=(',', ':')).encode() + '\n'.encode())
+        print("[SRS::Command] Connected to server")
         self.read_tcp()
 
     def read_tcp(self):
@@ -369,13 +378,13 @@ class SRSRecorder:
             data = self.tcp_socket.recv(8092)
             lines = data.decode().splitlines()
             if data == b'':
-                print("Connection closed")
+                print("WARN:: Connection closed")
                 break
             if lines:
                 for line in lines:
                     self.parse_response(line)
             elif data:
-                print("YOU SHOULD NEVER SEE THIS", data)
+                print("WARN:: YOU SHOULD NEVER SEE THIS", data)
 
     def parse_response(self, msg):
         """
@@ -400,14 +409,11 @@ class SRSRecorder:
         '''
         if msg_type == MSG_UPDATE:
             # these are sent on a regular basis so we know where people are
-            print("Got update")
             pass
         elif msg_type == MSG_PING:
-            print("ping... pong")
             pass
         elif msg_type == MSG_SYNC:
             # sync is sent when major events happen (e.g. connecting)
-            print("Got sync")
             if self.connecting:
                 self.send_slotted()
                 return
@@ -420,16 +426,17 @@ class SRSRecorder:
             pass
         elif msg_type == MSG_CLIENT_DISCONNECT:
             # I assume this is sent when someone drops but I'm not sure yet
-            print("Got disconnect:", msg)
+            print("WARNING:: Got disconnect:", msg)
         elif msg_type == MSG_VERSION_MISMATCH:
             # sent if we're running an incompatible version
-            print("Got version mismatch - quitting")
+            print("ERROR:: Got version mismatch - quitting")
             exit(1)
         elif msg_type == MSG_E_AWACS_PW or msg_type == MSG_E_AWACS_DC:
             # passworded radio stuff. will likely never care about this
             pass
         else:
-            print("IN >>", parsed)
+            pass
+            #print("IN >>", parsed)
         if 'Clients' in parsed.keys():
             # we get the currently connected clients, not a delta. reset the list so we can build it again
             self.connected_clients = []
@@ -512,7 +519,7 @@ class SRSRecorder:
                     self.stop_audio_tick = False
                     _thread.start_new_thread(self.audio_tick, ())
             elif message == b'MISSION_END':
-                self.print("command", "Caught mission end")
+                self.print("command", f"Caught mission end at {arrow.now()}")
                 self.packet_log.close()
                 self.stop_audio_tick = True
 
@@ -522,11 +529,10 @@ class SRSRecorder:
         :return:
             N/A
         """
-        print("Spawned UDP listener")
+        print("[SRS::Voice] Spawned UDP listener")
         self.udp_socket_voice = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM, proto=socket.IPPROTO_UDP)
         self.udp_socket_voice.sendto(self.client_guid.encode(), (self.host, self.port))
         message, address = self.udp_socket_voice.recvfrom(65535)
-        print("Initial sync:", message, address)
         self.read_udp()
 
     def read_udp(self):
@@ -568,7 +574,6 @@ class SRSRecorder:
                     for freq in parsed_voice['frequencies']:
                         # decode the (opus) packet
                         parsed_frames, decoded_length = self.radios[freq].opus_decoder.decode(parsed_voice)
-                        #self.radios[freq].last_received_time = current_time.shift(seconds=decoded_length)
                         self.radios[freq].last_rx = current_time
                         self.radios[freq].last_rx_extended = current_time.shift(seconds=decoded_length)
                         if not self.radios[freq].receiving:
@@ -578,15 +583,11 @@ class SRSRecorder:
                                 if not self.radios[freq].received_audio:
                                     # we do not pre-generate silence on the first stream
                                     self.radios[freq].received_audio = True
-                                    #self.radios[freq].lock.acquire()
-                                    #self.radios[freq].generate_silence((current_time - self.mission_start_time).total_seconds())
                                     self.print('audio', f'Detected first audio stream on {freq}',self.radios[freq])
-                                    #self.radios[freq].lock.release()
                                 else:
                                     # pre-generate silence before the stream begins
                                     self.radios[freq].lock.acquire()
                                     self.radios[freq].generate_silence(duration)
-                                    self.print('audio', f'Pre-generating {duration} seconds of silence', self.radios[freq])
                                     self.radios[freq].lock.release()
                             # update the radio to indicate that a new stream has begun
                             self.radios[freq].started_receiving = True
@@ -596,9 +597,9 @@ class SRSRecorder:
                             self.radios[freq].lock.release()
                         self.radios[freq].receiving = True
             else:
-                print("VOICE >> DISCARDED INVALID MESSAGE:", message)
+                print("WARN:: VOICE >> DISCARDED INVALID MESSAGE:", message)
         else:
-            print("VOICE >> MESSAGE TOO SHORT:", len(message), message)
+            print("WARN:: VOICE >> MESSAGE TOO SHORT:", len(message), message)
 
     @staticmethod
     def decode_voice_packet(message):
@@ -665,11 +666,13 @@ class SRSRecorder:
 
                 if radio.receiving and radio.started_receiving:
                     # we have just started receiving a new stream
+                    """
                     self.print(
                         "audio",
                         f"Started receiving new stream",
                         radio,
                     )
+                    """
                     radio.started_receiving = False
                     # based on test playbacks, this might not even be needed...
                     # radio.buffer += self.rx
@@ -683,7 +686,7 @@ class SRSRecorder:
                     silence_needed = round(len(radio.out_file) / radio.out_file.samplerate - (arrow.now() - self.mission_start_time).total_seconds(), 4) * -1
                     if silence_needed > 0:
                         radio.generate_silence(silence_needed)
-                        self.print("audio", f"ERROR CORRECTING with {silence_needed} seconds of one-off silence ;););)", radio)
+                        #self.print("audio", f"ERROR CORRECTING with {silence_needed} seconds of one-off silence ;););)", radio)
                     radio.lock.release()
                     radio.last_rx = None
                     radio.last_rx_extended = None
@@ -698,9 +701,10 @@ class SRSRecorder:
                         if recording_delta < 0:
                             # stop trying to be smart and just close the gap
                             radio.generate_silence(recording_delta * -1)
-                            self.print("audio", f"Generating {recording_delta * -1} seconds of silence", radio)
+                            #self.print("audio", f"Generating {recording_delta * -1} seconds of silence", radio)
                         else:
-                            self.print("audio", "Skipping silence generation as we're ahead", radio)
+                            #self.print("audio", "Skipping silence generation as we're ahead", radio)
+                            pass
                         radio.lock.release()
                     radio.last_tick = now
         os._exit(0)
