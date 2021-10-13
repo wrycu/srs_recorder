@@ -477,7 +477,7 @@ class SRSRecorder:
         :return:
             N/A
         """
-        self.udp_socket_cmd = socket.socket(family=socket.AF_INET, type=socket.SOCK_RAW, proto=socket.IPPROTO_UDP)
+        self.udp_socket_cmd = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM, proto=socket.IPPROTO_UDP)
         self.udp_socket_cmd.sendto('hello'.encode(), (self.host, self.port))
         while True:
             message, address = self.udp_socket_cmd.recvfrom(65535)
