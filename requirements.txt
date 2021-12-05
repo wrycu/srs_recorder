@@ -1,4 +1,5 @@
 arrow
 simpleaudio
 scipy
-numpy==1.19.3
+numpy
+soundfile

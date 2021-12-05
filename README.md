@@ -1,12 +1,16 @@
 # SRS Recorder
-This project aims to make debriefing DCS flights easier by providing SRS comms alongside the tacview playback of a flight.
+This project aims to make debriefing DCS flights easier by providing SRS comms alongside the Tacview playback of a flight.
+
 ## Setup
 In order to correctly determine the start and end time of a DCS mission, we need to install some hooks.
  1. Add the contents of `scripts\export.lua` to the end of your `Saved Games\DCS\Scripts\Export.lua` file
  2. Copy `scripts\srs_recorder.lua` to `Saved Games\DCS\Scripts\`
 
 ## Usage
-1. After setup, be sure to run `srs.py` BEFORE loading a mission
+1. Copy `config.ini.example` to `config.ini` and edit values as needed (in particular, the `output` value will likely need adjustment)
+2. Run `srs.py` BEFORE slotting into a mission
+3. When a mission is done, load the resulting `wav` files into Tacview using the `media` players
+    * **NOTE**: The MediaPlayers in TacView *MUST* be pinned for audio to play with the track 
 
 ## Config
 ### SRS

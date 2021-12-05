@@ -149,7 +149,7 @@ class Radio:
         self.opus_decoder.create()
         # for testing, we want to overwrite existing recordings. This will probably get removed as the project matures
         # zero out the file (yes there are easier ways to do it)
-        if not os.path.exists(out_file):
+        if not os.path.exists(os.path.dirname(out_file)):
             print("ERROR:: Audio recording path not found, please select an existing path")
             exit(5)
         wave_file = wave.open(out_file, 'wb')
