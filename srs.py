@@ -10,6 +10,10 @@ import wave
 import os
 import soundfile
 import configparser
+import grpc
+from grpc._channel import _InactiveRpcError, _MultiThreadedRendezvous
+from dcs.mission.v0 import mission_pb2_grpc, mission_pb2
+from dcs.hook.v0 import hook_pb2_grpc, hook_pb2
 
 MSG_UPDATE = 0
 MSG_PING = 1
@@ -150,7 +154,7 @@ class Radio:
         # for testing, we want to overwrite existing recordings. This will probably get removed as the project matures
         # zero out the file (yes there are easier ways to do it)
         if not os.path.exists(os.path.dirname(out_file)):
-            print("ERROR:: Audio recording path not found, please select an existing path")
+            print(f"ERROR:: Audio recording path for file {out_file} was not found, please select an existing path")
             exit(5)
         wave_file = wave.open(out_file, 'wb')
         wave_file.setnchannels(2)
@@ -329,6 +333,7 @@ class SRSRecorder:
         self.udp_socket_voice = None
         self.udp_socket_cmd = None
         self.packet_log = open('packets.txt', 'wb')
+        self.msn_name = 'UNKNOWN_MIZ'
 
     def __del__(self):
         for freq, radio in self.radios.items():
@@ -341,6 +346,14 @@ class SRSRecorder:
             now = arrow.now()
             radio.generate_silence((now - radio.last_stream_ended).total_seconds())
             radio.out_file.close()
+
+    def grpc_connect(self):
+        """
+        Block until we successfully connect to the DCS-gRPC server, then initialize the SRS connect sequence
+        :return:
+        """
+        self.msn_name = self.await_mission_start()
+        self.connect()
 
     def connect(self):
         """
@@ -375,7 +388,7 @@ class SRSRecorder:
             Does not return
         """
         while True:
-            data = self.tcp_socket.recv(8092)
+            data = self.tcp_socket.recv(65536)
             lines = data.decode().splitlines()
             if data == b'':
                 print("WARN:: Connection closed")
@@ -464,7 +477,10 @@ class SRSRecorder:
             self.radios[freq] = Radio(
                 frequency=freq,
                 decoder=OpusDecoder(self.sample_rate, 2, self.opus_dll),
-                out_file=os.path.join(self.output_dir, str(freq / 1000000) + '.ogg'),
+                out_file=os.path.join(
+                    self.output_dir,
+                    f"{str(arrow.now().date()).replace('-', '')}_{self.msn_name}_{str(freq / 1000000)}.ogg",
+                ),
             )
         for x in range(0, 11):
             self.state_blob['Client']['RadioInfo']['radios'][x]['secFreq'] = 0.0
@@ -474,6 +490,35 @@ class SRSRecorder:
         _thread.start_new_thread(self.spawn_udp_voice, ())
         _thread.start_new_thread(self.spawn_udp_cmd, ())
         _thread.start_new_thread(self.spawn_mission_tracker, ())
+
+    def await_mission_start(self):
+        """
+        Attempts to connect to the DCS-gRPC exporter and blocks until the mission is started
+        :return:
+            STRING: msn_name - Fully qualified mission name
+        """
+        self.print("Command", "attempting to connect to DCS-GRPC")
+        unpaused = False
+
+        while not unpaused:
+            try:
+                channel = grpc.insecure_channel('127.0.0.1:50051')
+                stub = mission_pb2_grpc.MissionServiceStub(channel)
+                hook_stub = hook_pb2_grpc.HookServiceStub(channel)
+                while not unpaused:
+                    # check if the mission has started
+                    cur_time = stub.GetScenarioCurrentTime(mission_pb2.StreamEventsRequest())
+                    start_time = stub.GetScenarioStartTime(mission_pb2.StreamEventsRequest())
+                    if cur_time != start_time:
+                        msn_name = hook_stub.GetMissionFilename(hook_pb2.GetMissionFilenameRequest()).name
+                        self.print("DCS::Mission", "caught unpause")
+                        return msn_name[msn_name.rfind('\\') + 1: -4]
+            except Exception as e:
+                # grpc doesn't raise a helpful exception, so just catch all of them
+                if not isinstance(e, _InactiveRpcError):
+                    # only print errors not related to failing to connect
+                    self.print("error", f"DCS-GRPC caught exception: type {type(e)}, msg {e}")
+                pass
 
     def spawn_udp_cmd(self):
         """
@@ -508,20 +553,37 @@ class SRSRecorder:
                 self.receiving = radio['IsReceiving']
 
     def spawn_mission_tracker(self):
-        udp_mission_sock = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM, proto=socket.IPPROTO_UDP)
-        udp_mission_sock.bind(('127.0.0.1', 5190))
-        while True:
-            message = udp_mission_sock.recv(65535)
-            if message == b'MISSION_START':
-                self.mission_start_time = arrow.now()
-                self.print("command", f"Caught mission start at {arrow.now()}")
-                if self.stop_audio_tick:
-                    self.stop_audio_tick = False
-                    _thread.start_new_thread(self.audio_tick, ())
-            elif message == b'MISSION_END':
-                self.print("command", f"Caught mission end at {arrow.now()}")
-                self.packet_log.close()
-                self.stop_audio_tick = True
+        # do initial setup stuff
+        self.mission_start_time = arrow.now()
+        self.print("command", f"Caught mission start at {arrow.now()}")
+        if self.stop_audio_tick:
+            self.stop_audio_tick = False
+            _thread.start_new_thread(self.audio_tick, ())
+        ended = False
+
+        while not ended:
+            try:
+                channel = grpc.insecure_channel('127.0.0.1:50051')
+                stub = mission_pb2_grpc.MissionServiceStub(channel)
+                while not ended:
+                    # check if the mission has ended
+                    response_stream = stub.StreamEvents(mission_pb2.StreamEventsRequest())
+                    for response in response_stream:
+                        event_name = response.WhichOneof("event")
+                        if event_name == 'mission_end':
+                            ended = True
+            except Exception as e:
+                # grpc doesn't raise a helpful exception, so just catch all of them
+                if isinstance(e, _InactiveRpcError) or isinstance(e, _MultiThreadedRendezvous):
+                    # if we can't connect at this stage, the mission has ended (or we've lost connectivity)
+                    ended = True
+                else:
+                    # only print errors not related to failing to connect
+                    self.print("error", f"DCS-GRPC caught exception: type {type(e)}, msg {e}")
+                pass
+        self.print("command", f"Caught mission end at {arrow.now()}")
+        self.packet_log.close()
+        self.stop_audio_tick = True
 
     def spawn_udp_voice(self):
         """
@@ -659,10 +721,8 @@ class SRSRecorder:
                 tick_delta = (now - radio.last_tick).total_seconds()
                 if radio.last_rx:
                     rx_delta = (now - radio.last_rx).total_seconds()
-                    rx_extended_delta = (now - radio.last_rx_extended).total_seconds()
                 else:
                     rx_delta = 0
-                    rx_extended_delta = 0
 
                 if radio.receiving and radio.started_receiving:
                     # we have just started receiving a new stream
@@ -726,7 +786,7 @@ class Environment:
     def __init__(self):
         pass
 
-    def get_install_paths(self):
+    def get_dcs_install_paths(self):
         install_paths = []
         check_paths = ['DCS.openbeta', 'DCS']
         base_path = os.path.expandvars('%USERPROFILE%') + '\\Saved Games'
@@ -736,6 +796,19 @@ class Environment:
             if os.path.exists(cur_path):
                 install_paths.append(cur_path)
 
+        return install_paths
+
+    def get_tacview_paths(self):
+        install_paths = []
+        check_paths = [
+            os.path.join('Tacview', 'AddOns'),
+        ]
+        base_path = os.path.expandvars('%APPDATA%')
+
+        for path in check_paths:
+            cur_path = os.path.join(base_path, path)
+            if os.path.exists(cur_path):
+                install_paths.append(cur_path)
         return install_paths
 
     def populate_export(self, path):
@@ -759,13 +832,30 @@ class Environment:
             print("Install completed")
 
     def configure(self):
-        paths = self.get_install_paths()
+        # old version
+        #paths = self.get_dcs_install_paths()
+        #for path in paths:
+        #    self.populate_export(path)
+        paths = self.get_tacview_paths()
         for path in paths:
-            self.populate_export(path)
+            self.populate_addon(path)
+
+    def populate_addon(self, path):
+        addon_directory = 'srs_recorder'
+        import shutil
+        destination_path = os.path.join(path, addon_directory, 'main.lua')
+        if not os.path.isdir(os.path.dirname(destination_path)):
+            print("Couldn't find srs_recorder Tacview addon, creating folder")
+            os.mkdir(os.path.join(path, addon_directory))
+        if not os.path.isfile(destination_path):
+            print("\tinstalling addon")
+            # copy the recorder file (done first so if it fails we don't muck with the export.lua file)
+            shutil.copyfile(os.path.join('scripts', 'main.lua'), destination_path)
+            print("Install completed")
 
 
 if __name__ == '__main__':
     e = Environment()
     e.configure()
     recorder = SRSRecorder()
-    recorder.connect()
+    recorder.grpc_connect()

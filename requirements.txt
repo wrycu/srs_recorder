@@ -3,3 +3,5 @@ simpleaudio
 scipy
 numpy
 soundfile
+grpcio
+grpcio-tools

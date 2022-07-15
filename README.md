@@ -2,21 +2,26 @@
 This project aims to make debriefing DCS flights easier by providing SRS comms alongside the Tacview playback of a flight.
 
 ## Setup
-In order to correctly determine the start and end time of a DCS mission, we need to install some hooks.
- 1. Add the contents of `scripts\export.lua` to the end of your `Saved Games\DCS\Scripts\Export.lua` file
- 2. Copy `scripts\srs_recorder.lua` to `Saved Games\DCS\Scripts\`
+* This project relies on `DCS-gRPC` being installed, configured, and running during your session. Please be sure this is done prior to running the recorder or nothing will be recorded. Installation instructions can be found in [their repo](https://github.com/DCS-gRPC/rust-server).
+* This project installs a Tacview AddOn which needs to be enabled
+    1. Click the gear (AddOns)
+    2. Enable/Disable AddOns
+    3. `srs-recorder`
 
 ## Usage
+### Limits
+* Note that some aircraft-specific radios (e.g. the Hornet MIDS) may not properly record
+* Note that this is intended to be installed on a client machine, not a dedicated server
+### Steps
 1. Copy `config.ini.example` to `config.ini` and edit values as needed (in particular, the `output` value will likely need adjustment)
 2. Run `srs.py` BEFORE slotting into a mission
-3. When a mission is done, load the resulting `wav` files into Tacview using the `media` players
-    * **NOTE**: The MediaPlayers in TacView *MUST* be pinned for audio to play with the track 
+3. That's it! SRS comms should automatically be synced when loading the matching Tacview recording
 
 ## Config
 ### SRS
 **ip**
 
-    IP address of the SRS server. Note that currently only 127.0.0.1 is supported.
+    IP address of the SRS server.
 **port**
 
     port SRS is listening on. SRS defaults to 5002, so unless the server changed it this should be fine.
