@@ -1,13 +1,16 @@
--- require a recent version of Tacview
+
+-- To communicate with Tacview, we first need to declare which interface we want to use.
+-- For instance this tutorial has been programmed for Tacview 1.7.3
+
 local Tacview = require("Tacview188")
 
--- Configure addon details before we can mess anything up
+-- Before anything else we should name our add-on
+
 Tacview.AddOns.Current.SetTitle("SRS Recorder")
-Tacview.AddOns.Current.SetVersion("1.0.0")
+Tacview.AddOns.Current.SetVersion("0.0.1")
 Tacview.AddOns.Current.SetAuthor("Wrycu")
 Tacview.AddOns.Current.SetNotes("Automatically loads SRS recordings")
 
--- listen for file load events and attempt to load matching recordings
 function handle_file_load(fileNames)
     Tacview.Log.Info("caught file load")
     Tacview.Log.Info(fileNames)
@@ -66,20 +69,55 @@ function find_audio(msn, date, dir)
     return results
 end
 
--- attempt to load the audio files
 function load_audio(audio_file)
     if (next(audio_file) == nill) then
         Tacview.Log.Info("no valid audio -- bailing")
         return
     end
-    loaded = Tacview.Media.Load(0, audio_file[1], Tacview.Context.GetAbsoluteTime())
-    Tacview.Log.Info("Loaded file:")
-    Tacview.Log.Info(loaded)
+    if (#audio_file > 1) then
+        Tacview.Log.Info("found multiple possible audio files, asking user which to load")
+        -- there is more than one possible audio file to load, ask them which they want to use
+        -- create the dialog object
+        audio_dialog = Tacview.UI.DialogBox.Create("SRS Recorder", 200, 40, "")
+        -- add helper text
+        Tacview.UI.DialogBox.AddText(audio_dialog, "Multiple recorded frequencies found, please select one to load", 5, 5, 299, 10)
+        for i, current_file in ipairs(audio_file) do
+            -- set up the buttons for each file
+            Tacview.UI.DialogBox.AddButton(
+                audio_dialog,
+                parse_freq(audio_file[i]) .. "Mhz",
+                i * 40,
+                15,
+                40,
+                20,
+                function ()
+                    -- call ourselves with the selected file and hide the dialog box
+                    load_audio({audio_file[i]})
+                    Tacview.UI.DialogBox.Hide(audio_dialog)
+                end
+            )
+        end
+        Tacview.UI.DialogBox.Show(audio_dialog)
+    else
+        loaded = Tacview.Media.Load(0, audio_file[1], Tacview.Context.GetAbsoluteTime())
+        Tacview.Log.Info("Loaded file:")
+        Tacview.Log.Info(loaded)
+    end
 end
 
-Tacview.Log.Info("Registering listeners")
--- load file listener
-Tacview.Events.DocumentLoaded.RegisterListener( handle_file_load )
--- unload file listener (can be used to auto-unload the audio file)
---Events.DocumentUnload.RegisterListener( function )
+function parse_freq(file_name)
+    -- 20220714_wrycu_training_syria_v1.3_day_127.5.ogg
+    return string.sub(
+        file_name,
+        string.len(file_name) - 8,
+        string.len(file_name) - 4
+    )
+end
 
+-- We can directly ask Tacview to display specific information in its log
+
+Tacview.Log.Info("Registering listeners")
+-- update file
+
+-- load file listner
+Tacview.Events.DocumentLoaded.RegisterListener( handle_file_load )
